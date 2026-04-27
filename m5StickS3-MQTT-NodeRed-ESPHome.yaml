@@ -1,0 +1,348 @@
+esphome:
+  name: m5sticks3-unit-a
+  friendly_name: M5StickS3 Unit A MQTT Synced Counter
+
+  includes:
+    - <Wire.h>
+    - <M5PM1.h>
+
+  libraries:
+    - Wire
+    - M5PM1=git+https://github.com/m5stack/M5PM1.git#1.0.6
+    - m5stack/M5Unified@^0.2.7
+    - m5stack/M5GFX@^0.2.16
+
+  platformio_options:
+    board_build.partitions: partitions/default_8MB.csv
+#    board_build.partitions: default_8MB.csv
+    board_build.arduino.memory_type: qio_opi
+    build_flags:
+      - -DESP32S3
+      - -DBOARD_HAS_PSRAM
+      - -mfix-esp32-psram-cache-issue
+      - -DCORE_DEBUG_LEVEL=5
+      - -DARDUINO_USB_CDC_ON_BOOT=1
+      - -DARDUINO_USB_MODE=1
+
+  on_boot:
+    - priority: 900
+      then:
+        - lambda: |-
+            static M5PM1 pm1;
+            static bool pmic_ready = false;
+
+            if (pmic_ready) {
+              return;
+            }
+
+            Wire.begin(47, 48, 100000);
+            delay(20);
+
+            pm1.begin(&Wire, 0x6E, 47, 48, 100000);
+            delay(20);
+
+            pm1.setDcdcEnable(true);
+            delay(20);
+            pm1.setLdoEnable(true);
+            delay(20);
+            pm1.setChargeEnable(true);
+            delay(20);
+            pm1.setBoostEnable(true);
+            delay(20);
+
+            // L3B path for LCD/audio rail
+            pm1.gpioSetFunc(M5PM1_GPIO_NUM_2, M5PM1_GPIO_FUNC_GPIO);
+            pm1.gpioSetMode(M5PM1_GPIO_NUM_2, M5PM1_GPIO_MODE_OUTPUT);
+            pm1.gpioSetDrive(M5PM1_GPIO_NUM_2, M5PM1_GPIO_DRIVE_PUSHPULL);
+            pm1.gpioSetOutput(M5PM1_GPIO_NUM_2, false);
+            delay(100);
+
+            pmic_ready = true;
+            ESP_LOGI("pm1", "PMIC init done: L2, L1, CHG, EXT_5V, L3B");
+
+    - priority: -100
+      then:
+        - light.turn_on:
+            id: backlight
+            brightness: 15%
+        - delay: 500ms
+        - component.update: stick_display
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 8MB
+  framework:
+    type: arduino
+    version: recommended
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  level: DEBUG
+  baud_rate: 0
+
+# Home Assistant native API intentionally removed.
+# This build is MQTT-only and uses Node-RED as the authoritative counter brain.
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "M5StickS3 MQTT Fallback"
+    password: !secret ap_password
+
+mqtt:
+  broker: !secret mqtt_broker
+  username: !secret mqtt_user
+  password: !secret mqtt_password
+  discovery: false
+  topic_prefix: m5sticks3/unit_a
+  birth_message:
+    topic: m5sticks3/unit_a/status
+    payload: online
+    retain: true
+  will_message:
+    topic: m5sticks3/unit_a/status
+    payload: offline
+    retain: true
+  on_connect:
+    then:
+      - logger.log: "MQTT connected; requesting current counter state"
+      - mqtt.publish_json:
+          topic: counters/capacity/command
+          payload: |-
+            root["action"] = "get";
+            root["source"] = App.get_name();
+      - mqtt.publish:
+          topic: counters/capacity/get
+          payload: "get"
+  on_json_message:
+    - topic: counters/capacity/state
+      then:
+        - lambda: |-
+            if (x.containsKey("value")) {
+              float old_value = id(counter_value);
+              id(counter_value) = x["value"].as<float>();
+              id(counter_state_seen) = true;
+              id(last_counter_update_ms) = millis();
+
+              if (id(counter_value) > old_value) {
+                id(last_delta) = 1;
+              } else if (id(counter_value) < old_value) {
+                id(last_delta) = -1;
+              } else {
+                id(last_delta) = 0;
+              }
+
+              if (x.containsKey("updated_by")) {
+                id(last_updated_by) = x["updated_by"].as<std::string>();
+              } else {
+                id(last_updated_by) = "mqtt";
+              }
+
+              ESP_LOGI("mqtt_counter", "Counter state received: %.0f", id(counter_value));
+            }
+
+captive_portal:
+
+web_server:
+  port: 80
+
+external_components:
+  - source:
+      type: local
+      path: components
+
+output:
+  - platform: ledc
+    pin: GPIO38
+    id: lcd_backlight_raw
+    frequency: 1000Hz
+
+light:
+  - platform: monochromatic
+    id: backlight
+    name: "StickS3 Backlight"
+    output: lcd_backlight_raw
+    restore_mode: ALWAYS_ON
+    default_transition_length: 0s
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 24
+  - file: "gfonts://Roboto"
+    id: font_big
+    size: 42
+  - file: "gfonts://Roboto"
+    id: font_tiny
+    size: 16
+
+globals:
+  - id: counter_value
+    type: float
+    restore_value: no
+    initial_value: '0'
+  - id: counter_state_seen
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: last_counter_update_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: last_delta
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: last_updated_by
+    type: std::string
+    restore_value: no
+    initial_value: '"none"'
+
+display:
+  - platform: m5sticks3_display
+    id: stick_display
+    update_interval: 250ms
+    lambda: |-
+      it.fill(esphome::Color(0, 0, 0));
+
+      it.printf(6, 12, id(font_small), esphome::Color(255, 255, 255), "Capacity Counter A");
+
+      if (id(counter_state_seen)) {
+        it.printf(6, 48, id(font_big), esphome::Color(255, 255, 0), "%.0f", id(counter_value));
+      } else {
+        it.printf(6, 48, id(font_big), esphome::Color(255, 128, 0), "--");
+      }
+
+      if (id(mqtt_client).is_connected()) {
+        it.printf(6, 101, id(font_tiny), esphome::Color(0, 220, 80), "MQTT online");
+      } else {
+        it.printf(6, 101, id(font_tiny), esphome::Color(255, 60, 60), "MQTT offline");
+      }
+
+      uint32_t age = millis() - id(last_counter_update_ms);
+      if (id(counter_state_seen) && age < 1200) {
+        if (id(last_delta) > 0) {
+          it.printf(148, 101, id(font_tiny), esphome::Color(0, 220, 80), "+1");
+        } else if (id(last_delta) < 0) {
+          it.printf(148, 101, id(font_tiny), esphome::Color(255, 80, 80), "-1");
+        } else {
+          it.printf(148, 101, id(font_tiny), esphome::Color(180, 180, 180), "sync");
+        }
+      }
+
+binary_sensor:
+  - platform: status
+    id: sys_status
+    name: "StickS3 Status"
+
+  - platform: gpio
+    id: key1
+    name: "StickS3 Key1"
+    pin:
+      number: GPIO11
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on: 10ms
+      - delayed_off: 10ms
+    on_press:
+      - logger.log: "StickS3 Key1 pressed -> request counter state"
+      - mqtt.publish:
+          topic: counters/capacity/get
+          payload: "get"
+
+  - platform: gpio
+    id: key2
+    name: "StickS3 Key2"
+    pin:
+      number: GPIO12
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on: 10ms
+      - delayed_off: 10ms
+    on_press:
+      - logger.log: "StickS3 Key2 pressed -> reset counter"
+      - mqtt.publish_json:
+          topic: counters/capacity/command
+          payload: |-
+            root["action"] = "reset";
+            root["source"] = App.get_name();
+
+  - platform: gpio
+    id: red_button
+    name: "Dual Button Red"
+    pin:
+      number: GPIO9
+      mode:
+        input: true
+      inverted: true
+    filters:
+      - delayed_on: 10ms
+      - delayed_off: 10ms
+    on_press:
+      - logger.log: "Dual Button RED pressed -> MQTT decrement"
+      - mqtt.publish_json:
+          topic: counters/capacity/command
+          payload: |-
+            root["action"] = "decrement";
+            root["source"] = App.get_name();
+
+  - platform: gpio
+    id: blue_button
+    name: "Dual Button Blue"
+    pin:
+      number: GPIO10
+      mode:
+        input: true
+      inverted: true
+    filters:
+      - delayed_on: 10ms
+      - delayed_off: 10ms
+    on_press:
+      - logger.log: "Dual Button BLUE pressed -> MQTT increment"
+      - mqtt.publish_json:
+          topic: counters/capacity/command
+          payload: |-
+            root["action"] = "increment";
+            root["source"] = App.get_name();
+
+sensor:
+  - platform: template
+    id: mqtt_counter_value_sensor
+    name: "Capacity Counter MQTT Value"
+    lambda: |-
+      if (!id(counter_state_seen)) {
+        return NAN;
+      }
+      return id(counter_value);
+    update_interval: 1s
+
+  - platform: uptime
+    name: "StickS3 Uptime"
+
+  - platform: wifi_signal
+    id: wifi_rssi
+    name: "StickS3 WiFi RSSI"
+    update_interval: 60s
+
+text_sensor:
+  - platform: template
+    id: last_counter_update_source
+    name: "Capacity Counter Last Updated By"
+    lambda: |-
+      return id(last_updated_by);
+    update_interval: 1s

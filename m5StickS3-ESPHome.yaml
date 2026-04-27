@@ -14,7 +14,6 @@ esphome:
 
   platformio_options:
     board_build.partitions: partitions/default_8MB.csv
-#    board_build.partitions: default_8MB.csv
     board_build.arduino.memory_type: qio_opi
     build_flags:
       - -DESP32S3
